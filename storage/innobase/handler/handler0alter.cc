@@ -4227,13 +4227,9 @@ innobase_add_one_instant(
 	ulint	field_type;
 	ulint	charset_no;
 	dberr_t error;
-	mem_heap_t*	heap = NULL;
 	dict_col_t	tmp_col;
 	ulint 		prtype;
 	pars_info_t*    info;
-	byte*		def_val = NULL;
-	ulint		def_val_len = 0;
-
 
 	ulint	col_type
 		= get_innobase_type_from_mysql_type(
@@ -4246,9 +4242,7 @@ innobase_add_one_instant(
 	if (dict_col_name_is_reserved(field->field_name.str)){
 		my_error(ER_WRONG_COLUMN_NAME, MYF(0),
 			field->field_name.str);
-
-		error = DB_ERROR;
-		goto err_exit;
+		return(DB_ERROR);
 	}
 
 	col_len = field->pack_length();
@@ -4272,8 +4266,7 @@ innobase_add_one_instant(
 		if (charset_no > MAX_CHAR_COLL_NUM) {
 			my_error(ER_WRONG_KEY_COLUMN, MYF(0), "InnoDB",
 				field->field_name);
-			error = DB_ERROR;
-			goto err_exit;
+			return(DB_ERROR);
 		}
 	} else {
 		charset_no = 0;
@@ -4314,80 +4307,18 @@ innobase_add_one_instant(
 			FALSE, trx);
 
 	if (error != DB_SUCCESS) {
-		goto err_exit;
+		return(error);
 	}
 
 	memset((byte*)&tmp_col, 0, sizeof(dict_col_t));
 	dict_mem_fill_column_struct(&tmp_col, pos_in_innodb, col_type, prtype, col_len);
 
-	heap = mem_heap_create(1024);
-	
 	// Note: field->field_index is not always equal to pos(because of virtual columns)
-	error = innobase_get_field_def_value(altered_table, &tmp_col, field->field_index, dict_table_is_comp(table), heap, &def_val, &def_val_len);
-	if (error != DB_SUCCESS) {
-		goto err_exit;
-	}
+	//	error = innobase_get_field_def_value(altered_table, &tmp_col, field->field_index, dict_table_is_comp(table), heap, &def_val, &def_val_len);
 
-	info = pars_info_create();
+	// FIXME: replace a MIN_REC with the column values */
 
-	pars_info_add_ull_literal(info, "id", table->id);
-	pars_info_add_int4_literal(info, "pos", pos_in_innodb);
-	pars_info_add_literal(info, "default_value", def_val, def_val_len, DATA_BLOB, DATA_BINARY_TYPE);
-
-	error = que_eval_sql(
-		info,
-		"PROCEDURE P () IS\n"
-		"BEGIN\n"
-		"INSERT INTO SYS_COLUMNS_ADDED VALUES"
-		"(:id, :pos, :default_value);\n"
-		"END;\n",
-		FALSE, trx);
-
-	if (error != DB_SUCCESS) {
-		goto err_exit;
-	}
-
-
-err_exit:
-	if (heap) {
-		mem_heap_free(heap);
-	}
 	return(error);
-}
-
-/** Update INNODB SYS_TABLES on number of instant added columns
-@param[in] user_table	InnoDB table
-@param[in] n_col	number of columns
-@param[in] trx		transaction
-@return DB_SUCCESS if successful, otherwise error code */
-static
-dberr_t
-innobase_update_n_instant(
-	const dict_table_t*	table,
-	ulint			n_col,
-	trx_t*			trx)
-{
-	dberr_t		err = DB_SUCCESS;
-	pars_info_t*    info = pars_info_create();
-
-	ulint mix_len = dict_table_encode_mix_len(table->flags2, 
-			table->n_core_cols - dict_table_get_n_sys_cols(table));
-
-	pars_info_add_int4_literal(info, "num_col", n_col);
-	pars_info_add_int4_literal(info, "mix_len", mix_len);
-	pars_info_add_ull_literal(info, "id", table->id);
-
-	err = que_eval_sql(
-                info,
-                "PROCEDURE RENUMBER_TABLE_ID_PROC () IS\n"
-                "BEGIN\n"
-                "UPDATE SYS_TABLES"
-                " SET N_COLS = :num_col,\n"
-                " MIX_LEN = :mix_len\n"
-                " WHERE ID = :id;\n"
-		"END;\n", FALSE, trx);
-
-	return(err);
 }
 
 /** Update system table for instant adding column(s)
@@ -4452,14 +4383,6 @@ innobase_add_instant_try(
 
 	ulint	new_n = dict_table_encode_n_col(n_col, n_v_col)
 			+ ((user_table->flags & DICT_TF_COMPACT) << 31);
-
-	err = innobase_update_n_instant(user_table, new_n, trx);
-
-	if (err != DB_SUCCESS) {
-		my_error(ER_INTERNAL_ERROR, MYF(0),
-			 "InnoDB: ADD COLUMN...INSTANT");
-		return(true);
-	}
 
 	return(false);
 }
@@ -5051,7 +4974,7 @@ prepare_inplace_alter_table_dict(
 		/* The initial space id 0 may be overridden later if this
 		table is going to be a file_per_table tablespace. */
 		ctx->new_table = dict_mem_table_create(
-			new_table_name, space_id, n_cols + n_v_cols, 0, n_v_cols,
+			new_table_name, space_id, n_cols + n_v_cols, n_v_cols,
 			flags, flags2);
 
 		/* The rebuilt indexed_table will use the renamed
