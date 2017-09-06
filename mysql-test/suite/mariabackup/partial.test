@@ -17,7 +17,7 @@ list_files $targetdir/test *.ibd;
 
 echo # xtrabackup prepare;
 --disable_result_log
-exec $XTRABACKUP --prepare --export --target-dir=$targetdir;
+exec $XTRABACKUP --defaults-file=$MYSQLTEST_VARDIR/my.cnf --defaults-group-suffix=.1 --prepare --export --target-dir=$targetdir;
 --enable_result_log
 
 ALTER TABLE t1 DISCARD TABLESPACE;

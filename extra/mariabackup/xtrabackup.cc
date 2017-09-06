@@ -139,6 +139,10 @@ char xtrabackup_real_incremental_basedir[FN_REFLEN];
 char xtrabackup_real_extra_lsndir[FN_REFLEN];
 char xtrabackup_real_incremental_dir[FN_REFLEN];
 
+static int get_exe_path(char *, size_t, const char *);
+
+static char mariabackup_exe_path[FN_REFLEN];
+
 char *xtrabackup_tmpdir;
 
 char *xtrabackup_tables;
@@ -332,6 +336,9 @@ const char *opt_history = NULL;
 my_bool opt_ssl_verify_server_cert = FALSE;
 #endif
 
+char mariabackup_exe[FN_REFLEN];
+char orig_argv1[FN_REFLEN];
+
 /* Whether xtrabackup_binlog_info should be created on recovery */
 static bool recover_binlog_info;
 
@@ -347,6 +354,11 @@ xtrabackup_add_datasink(ds_ctxt_t *ds)
 	xb_ad(actual_datasinks < XTRABACKUP_MAX_DATASINKS);
 	datasinks[actual_datasinks] = ds; actual_datasinks++;
 }
+
+
+typedef void (*process_single_tablespace_func_t)(const char *dirname, const char *filname, bool is_remote);
+static dberr_t enumerate_ibd_files(process_single_tablespace_func_t callback);
+
 
 /* ======== Datafiles iterator ======== */
 struct datafiles_iter_t {
@@ -1122,6 +1134,120 @@ debug_sync_point(const char *name)
 	my_delete(pid_path, MYF(MY_WME));
 #endif
 }
+
+
+static std::vector<std::string> tables_for_export;
+
+static void append_export_table(const char *dbname, const char *tablename, bool is_remote)
+{
+  if(dbname && tablename && !is_remote)
+  {
+    char buf[3*FN_REFLEN];
+    char db_utf8[FN_REFLEN];
+    char table_utf8[FN_REFLEN];
+
+    snprintf(buf,sizeof(buf),"%s/%s",dbname, tablename);
+    // trim .ibd
+    char *p=strrchr(buf, '.');
+    if (p) *p=0;
+
+    dict_fs2utf8(buf, db_utf8, sizeof(db_utf8),table_utf8,sizeof(table_utf8));
+    snprintf(buf,sizeof(buf),"`%s`.`%s`",db_utf8,table_utf8);
+    tables_for_export.push_back(buf);
+  }
+}
+
+static std::string get_export_tables_stmt()
+{
+  std::string s="FLUSH TABLES ";
+  enumerate_ibd_files(append_export_table);
+  size_t N= tables_for_export.size();
+  if (N == 0)
+    return "";
+  for (size_t i= 0; i < N; i++)
+  {
+    if (i)
+      s+=",";
+
+    s+= tables_for_export[i];
+  }
+  s += " FOR EXPORT;";
+  return s;
+}
+
+#define BOOTSTRAP_FILENAME "mariabackup_prepare_for_export.sql"
+
+static int prepare_export()
+{
+  int err= -1;
+
+  char cmdline[2*FN_REFLEN];
+
+  std::string content = get_export_tables_stmt();
+
+  FILE *bootstrap_file= fopen(BOOTSTRAP_FILENAME,"w");
+  if(!bootstrap_file)
+    goto end;
+
+  if (content.size())
+  {
+    if (fputs("SET NAMES UTF8;\n",bootstrap_file) < 0)
+      goto end;
+
+    if (fputs(content.c_str(), bootstrap_file) < 0)
+      goto end;
+  }
+
+  fclose(bootstrap_file);
+  bootstrap_file=0;
+
+
+  // Process defaults-file , it can have some --lc-language stuff,
+  // which is* unfortunately* still necessary to get mysqld up
+  if (strncmp(orig_argv1,"--defaults-file=",16) == 0)
+  {
+    sprintf(cmdline, 
+     IF_WIN("\"","") "\"%s\" --mysqld \"%s\" --defaults-group-suffix=%s"
+      " --defaults-extra-file=./backup-my.cnf --datadir=."
+      " --innodb --innodb-fast-shutdown=0"
+      " --innodb_purge_rseg_truncate_frequency=1 --innodb-buffer-pool-size=%llu"
+      " --console  --bootstrap  < "  BOOTSTRAP_FILENAME IF_WIN("\"",""),
+      mariabackup_exe, 
+      orig_argv1, (my_defaults_group_suffix?my_defaults_group_suffix:""),
+      xtrabackup_use_memory);
+  }
+  else
+  {
+    sprintf(cmdline,
+     IF_WIN("\"","") "\"%s\" --mysqld"
+      " --defaults-file=./backup-my.cnf --datadir=."
+      " --innodb --innodb-fast-shutdown=0"
+      " --innodb_purge_rseg_truncate_frequency=1 --innodb-buffer-pool-size=%llu"
+      " --console  --bootstrap  < "  BOOTSTRAP_FILENAME IF_WIN("\"",""),
+      mariabackup_exe,
+      xtrabackup_use_memory);
+  }
+
+  msg("Prepare export : executing %s\n", cmdline);
+  fflush(stderr);
+
+  FILE *outf= popen(cmdline,"r");
+  if (!outf)
+    goto end;
+  
+  char outline[FN_REFLEN];
+  while(fgets(outline, sizeof(outline)-1, outf))
+    fprintf(stderr,"%s",outline);
+
+  err = pclose(outf);
+
+end:
+  if(bootstrap_file)
+    fclose(bootstrap_file);
+  unlink(BOOTSTRAP_FILENAME);
+  return err;
+}
+
 
 static const char *xb_client_default_groups[]=
 	{ "xtrabackup", "client", 0, 0, 0 };
@@ -2520,6 +2646,7 @@ xb_new_datafile(const char *name, bool is_remote)
 	}
 }
 
+
 static
 void
 xb_load_single_table_tablespace(
@@ -2581,7 +2708,7 @@ xb_load_single_table_tablespace(
 
 		ut_a(space != NULL);
 
-		if (!fil_node_create(file->filepath(), n_pages, space,
+		if (!fil_node_create(file->filepath(), ulint(n_pages), space,
 				     false, false)) {
 			ut_error;
 		}
@@ -2610,9 +2737,8 @@ xb_load_single_table_tablespace(
 /** Scan the database directories under the MySQL datadir, looking for
 .ibd files and determining the space id in each of them.
 @return	DB_SUCCESS or error number */
-static
-dberr_t
-xb_load_single_table_tablespaces()
+
+static dberr_t enumerate_ibd_files(process_single_tablespace_func_t callback)
 {
 	int		ret;
 	char*		dbpath		= NULL;
@@ -2650,8 +2776,7 @@ xb_load_single_table_tablespaces()
 				&& !strcmp(dbinfo.name + len - 4, ".ibd");
 
 			if (is_isl || is_ibd) {
-				xb_load_single_table_tablespace(
-					NULL, dbinfo.name, is_isl);
+				(*callback)(NULL, dbinfo.name, is_isl);
 			}
 		}
 
@@ -2710,9 +2835,7 @@ xb_load_single_table_tablespaces()
 				if (len > 4
 				    && !strcmp(fileinfo.name + len - 4,
 					       ".ibd")) {
-					xb_load_single_table_tablespace(
-						dbinfo.name, fileinfo.name,
-						false);
+					(*callback)(dbinfo.name, fileinfo.name, false);
 				}
 			}
 
@@ -2807,7 +2930,7 @@ xb_load_tablespaces()
 
 	msg("xtrabackup: Generating a list of tablespaces\n");
 
-	err = xb_load_single_table_tablespaces();
+	err = enumerate_ibd_files(xb_load_single_table_tablespace);
 	if (err != DB_SUCCESS) {
 		return(err);
 	}
@@ -3232,7 +3355,7 @@ open_or_create_log_file(
 
 	ut_a(fil_validate());
 
-	ut_a(fil_node_create(name, srv_log_file_size >> srv_page_size_shift,
+	ut_a(fil_node_create(name, ulint(srv_log_file_size >> srv_page_size_shift),
 			     space, false, false));
 
 	return(DB_SUCCESS);
@@ -4884,7 +5007,6 @@ store_binlog_info(const char* filename, const char* name, ulonglong pos)
 static bool
 xtrabackup_prepare_func(char** argv)
 {
-	datafiles_iter_t	*it;
 	char			 metadata_path[FN_REFLEN];
 
 	/* cd to target-dir */
@@ -4953,9 +5075,7 @@ xtrabackup_prepare_func(char** argv)
 		srv_operation = SRV_OPERATION_RESTORE_DELTA;
 
 		if (innodb_init_param()) {
-error_cleanup:
-			xb_filters_free();
-			return(false);
+			goto error_cleanup;
 		}
 
 		xb_normalize_init_values();
@@ -5028,169 +5148,6 @@ error_cleanup:
 		goto error_cleanup;
 	}
 
-	if (xtrabackup_export) {
-#if 1 // FIXME: remove the option or fix the logic
-		/* In MariaDB 10.2, undo log processing would need the
-		ability to evaluate indexed virtual columns, and we
-		have not initialized the necessary infrastructure. */
-		msg("xtrabackup: --export does not work!\n");
-		ok = false;
-	} else if (xtrabackup_export) {
-#endif
-		msg("xtrabackup: export option is specified.\n");
-
-		/* To allow subsequent MariaDB server startup independent
-		of the value of --innodb-log-checksums,
-		unconditionally enable redo log checksums. */
-		log_checksum_algorithm_ptr = log_block_calc_checksum_crc32;
-
-		pfs_os_file_t	info_file;
-		char		info_file_path[FN_REFLEN];
-		bool		success;
-		char		table_name[FN_REFLEN];
-
-		byte*		page;
-		byte*		buf = NULL;
-
-		buf = static_cast<byte *>(malloc(UNIV_PAGE_SIZE * 2));
-		page = static_cast<byte *>(ut_align(buf, UNIV_PAGE_SIZE));
-
-		it = datafiles_iter_new(fil_system);
-		if (it == NULL) {
-			msg("xtrabackup: Error: datafiles_iter_new() "
-			    "failed.\n");
-			ok = false;
-		} else
-		while (fil_node_t *node = datafiles_iter_next(it)) {
-			int		 len;
-			char		*next, *prev, *p;
-			dict_table_t*	 table;
-			dict_index_t*	 index;
-			ulint		 n_index;
-
-			const fil_space_t* space = node->space;
-
-			/* treat file_per_table only */
-			if (!fil_is_user_tablespace_id(space->id)) {
-				continue;
-			}
-
-			/* node exist == file exist, here */
-			strcpy(info_file_path, node->name);
-#ifdef _WIN32
-			for (int i = 0; info_file_path[i]; i++)
-				if (info_file_path[i] == '\\')
-					info_file_path[i]= '/';
-#endif
-			strcpy(info_file_path +
-			       strlen(info_file_path) -
-			       4, ".exp");
-
-			len =(ib_uint32_t)strlen(info_file_path);
-
-			p = info_file_path;
-			prev = NULL;
-			while ((next = strchr(p, '/')) != NULL)
-			{
-				prev = p;
-				p = next + 1;
-			}
-			info_file_path[len - 4] = 0;
-			strncpy(table_name, prev, FN_REFLEN);
-
-			info_file_path[len - 4] = '.';
-
-			mutex_enter(&(dict_sys->mutex));
-
-			table = dict_table_get_low(table_name);
-			if (!table) {
-				msg("xtrabackup: error: "
-				    "cannot find dictionary "
-				    "record of table %s\n",
-				    table_name);
-				goto next_node;
-			}
-
-			/* Write MySQL 5.6 .cfg file */
-			if (!xb_export_cfg_write(node, table)) {
-				goto next_node;
-			}
-
-			index = dict_table_get_first_index(table);
-			n_index = UT_LIST_GET_LEN(table->indexes);
-			if (n_index > 31) {
-				msg("xtrabackup: warning: table '%s' has more "
-				    "than 31 indexes, .exp file was not "
-				    "generated. Table will fail to import "
-				    "on server version prior to 5.6.\n",
-				    table->name.m_name);
-				goto next_node;
-			}
-
-			/* init exp file */
-			memcpy(page, "xportinf", 8);
-			mach_write_to_4(page + 8, n_index);
-			memset(page + 12, 0, UNIV_PAGE_SIZE - 12);
-			strncpy((char *) page + 12,
-				table_name, 500);
-
-			msg("xtrabackup: export metadata of "
-			    "table '%s' to file `%s` "
-			    "(%lu indexes)\n",
-			    table_name, info_file_path,
-			    n_index);
-
-			n_index = 1;
-			while (index) {
-				mach_write_to_8(page + n_index * 512, index->id);
-				mach_write_to_4(page + n_index * 512 + 8,
-						index->page);
-				strncpy((char *) page + n_index * 512 +
-					12, index->name, 500);
-
-				msg("xtrabackup:     name=%s, "
-				    "id.low=%lu, page=%lu\n",
-				    index->name(),
-				    (ulint)(index->id &
-					    0xFFFFFFFFUL),
-				    (ulint) index->page);
-				index = dict_table_get_next_index(index);
-				n_index++;
-			}
-
-			os_normalize_path(info_file_path);
-			info_file = os_file_create(
-				0,
-				info_file_path,
-				OS_FILE_OVERWRITE,
-				OS_FILE_NORMAL, OS_DATA_FILE,
-				false, &success);
-			if (!success) {
-				os_file_get_last_error(TRUE);
-				goto next_node;
-			}
-			success = os_file_write(IORequestWrite, info_file_path,
-						info_file, page,
-						0, UNIV_PAGE_SIZE);
-			if (!success) {
-				os_file_get_last_error(TRUE);
-				goto next_node;
-			}
-			success = os_file_flush(info_file);
-			if (!success) {
-				os_file_get_last_error(TRUE);
-				goto next_node;
-			}
-next_node:
-			if (info_file != OS_FILE_CLOSED) {
-				os_file_close(info_file);
-				info_file = OS_FILE_CLOSED;
-			}
-			mutex_exit(&(dict_sys->mutex));
-		}
-
-		free(buf);
-	}
 
 	if (ok) {
 		mtr_t			mtr;
@@ -5275,6 +5232,10 @@ next_node:
 
 	if (ok) ok = apply_log_finish();
 
+	if (ok && xtrabackup_export)
+		ok= (prepare_export() == 0);
+
+error_cleanup:
 	xb_filters_free();
 	return ok;
 }
@@ -5594,17 +5555,41 @@ handle_options(int argc, char **argv, char ***argv_client, char ***argv_server)
 }
 
 static int main_low(char** argv);
+static int get_exepath(char *buf, size_t size, const char *argv0);
 
 /* ================= main =================== */
 int main(int argc, char **argv)
 {
 	char **client_defaults, **server_defaults;
-	if (argc > 1 && (strcmp(argv[1], "--innobackupex") == 0))
+
+	if (get_exepath(mariabackup_exe,FN_REFLEN, argv[0]))
+    strncpy(mariabackup_exe,argv[0], FN_REFLEN-1);
+
+
+	if (argc > 1 )
 	{
-		argv++;
-		argc--;
-		innobackupex_mode = true;
+		/* In "prepare export", we need  to start mysqld 
+		Since it is not always be installed on the machine,
+		we start "mariabackup --mysqld", which acts as mysqld
+		*/
+		if (strcmp(argv[1], "--mysqld") == 0)
+		{
+			extern int mysqld_main(int argc, char **argv);
+			argc--;
+			argv++;
+			argv[0]+=2;
+			return mysqld_main(argc, argv);
+		}
+		if(strcmp(argv[1], "--innobackupex") == 0)
+		{
+			argv++;
+			argc--;
+			innobackupex_mode = true;
+		}
 	}
+  
+	if (argc > 1)
+		strncpy(orig_argv1,argv[1],sizeof(orig_argv1) -1);
 
 	init_signals();
 	MY_INIT(argv[0]);
@@ -5860,3 +5845,20 @@ static int main_low(char** argv)
 
 	return(EXIT_SUCCESS);
 }
+
+
+static int get_exepath(char *buf, size_t size, const char *argv0)
+{
+#ifdef _WIN32
+  DWORD ret = GetModuleFileNameA(NULL, buf, size);
+  if (ret > 0)
+    return 0;
+#elif defined(__linux__)
+  ssize_t ret = readlink("/proc/self/exe", buf, size-1);
+  if(ret > 0)
+    return 0;
+#endif
+
+  return my_realpath(buf, argv0, 0);
+}
+
