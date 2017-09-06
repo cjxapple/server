@@ -139,9 +139,6 @@ char xtrabackup_real_incremental_basedir[FN_REFLEN];
 char xtrabackup_real_extra_lsndir[FN_REFLEN];
 char xtrabackup_real_incremental_dir[FN_REFLEN];
 
-static int get_exe_path(char *, size_t, const char *);
-
-static char mariabackup_exe_path[FN_REFLEN];
 
 char *xtrabackup_tmpdir;
 
@@ -1200,6 +1197,7 @@ static int prepare_export()
 
   fclose(bootstrap_file);
   bootstrap_file=0;
+  FILE *outf;
 
 
   // Process defaults-file , it can have some --lc-language stuff,
@@ -1211,7 +1209,7 @@ static int prepare_export()
       " --defaults-extra-file=./backup-my.cnf --datadir=."
       " --innodb --innodb-fast-shutdown=0"
       " --innodb_purge_rseg_truncate_frequency=1 --innodb-buffer-pool-size=%llu"
-      " --console  --bootstrap  < "  BOOTSTRAP_FILENAME IF_WIN("\"",""),
+      " --console  --log-error= --bootstrap  < "  BOOTSTRAP_FILENAME IF_WIN("\"",""),
       mariabackup_exe, 
       orig_argv1, (my_defaults_group_suffix?my_defaults_group_suffix:""),
       xtrabackup_use_memory);
@@ -1223,7 +1221,7 @@ static int prepare_export()
       " --defaults-file=./backup-my.cnf --datadir=."
       " --innodb --innodb-fast-shutdown=0"
       " --innodb_purge_rseg_truncate_frequency=1 --innodb-buffer-pool-size=%llu"
-      " --console  --bootstrap  < "  BOOTSTRAP_FILENAME IF_WIN("\"",""),
+      " --console  --log-error= --bootstrap  < "  BOOTSTRAP_FILENAME IF_WIN("\"",""),
       mariabackup_exe,
       xtrabackup_use_memory);
   }
@@ -1231,7 +1229,7 @@ static int prepare_export()
   msg("Prepare export : executing %s\n", cmdline);
   fflush(stderr);
 
-  FILE *outf= popen(cmdline,"r");
+  outf= popen(cmdline,"r");
   if (!outf)
     goto end;
   
@@ -4628,349 +4626,6 @@ xtrabackup_apply_deltas()
 		xtrabackup_apply_delta);
 }
 
-/*********************************************************************//**
-Write the meta data (index user fields) config file.
-@return true in case of success otherwise false. */
-static
-bool
-xb_export_cfg_write_index_fields(
-/*===========================*/
-	const dict_index_t*	index,	/*!< in: write the meta data for
-					this index */
-	FILE*			file)	/*!< in: file to write to */
-{
-	byte			row[sizeof(ib_uint32_t) * 2];
-
-	for (ulint i = 0; i < index->n_fields; ++i) {
-		byte*			ptr = row;
-		const dict_field_t*	field = &index->fields[i];
-
-		mach_write_to_4(ptr, field->prefix_len);
-		ptr += sizeof(ib_uint32_t);
-
-		mach_write_to_4(ptr, field->fixed_len);
-
-		if (fwrite(row, 1, sizeof(row), file) != sizeof(row)) {
-
-			msg("xtrabackup: Error: writing index fields.");
-
-			return(false);
-		}
-
-		/* Include the NUL byte in the length. */
-		ib_uint32_t	len = (ib_uint32_t)strlen(field->name) + 1;
-		ut_a(len > 1);
-
-		mach_write_to_4(row, len);
-
-		if (fwrite(row, 1,  sizeof(len), file) != sizeof(len)
-		    || fwrite(field->name, 1, len, file) != len) {
-
-			msg("xtrabackup: Error: writing index column.");
-
-			return(false);
-		}
-	}
-
-	return(true);
-}
-
-/*********************************************************************//**
-Write the meta data config file index information.
-@return true in case of success otherwise false. */
-static	__attribute__((nonnull, warn_unused_result))
-bool
-xb_export_cfg_write_indexes(
-/*======================*/
-	const dict_table_t*	table,	/*!< in: write the meta data for
-					this table */
-	FILE*			file)	/*!< in: file to write to */
-{
-	{
-		byte		row[sizeof(ib_uint32_t)];
-
-		/* Write the number of indexes in the table. */
-		mach_write_to_4(row, UT_LIST_GET_LEN(table->indexes));
-
-		if (fwrite(row, 1, sizeof(row), file) != sizeof(row)) {
-			msg("xtrabackup: Error: writing index count.");
-
-			return(false);
-		}
-	}
-
-	bool			ret = true;
-
-	/* Write the index meta data. */
-	for (const dict_index_t* index = UT_LIST_GET_FIRST(table->indexes);
-	     index != 0 && ret;
-	     index = UT_LIST_GET_NEXT(indexes, index)) {
-
-		byte*		ptr;
-		byte		row[sizeof(ib_uint64_t)
-				    + sizeof(ib_uint32_t) * 8];
-
-		ptr = row;
-
-		ut_ad(sizeof(ib_uint64_t) == 8);
-		mach_write_to_8(ptr, index->id);
-		ptr += sizeof(ib_uint64_t);
-
-		mach_write_to_4(ptr, index->space);
-		ptr += sizeof(ib_uint32_t);
-
-		mach_write_to_4(ptr, index->page);
-		ptr += sizeof(ib_uint32_t);
-
-		mach_write_to_4(ptr, index->type);
-		ptr += sizeof(ib_uint32_t);
-
-		mach_write_to_4(ptr, index->trx_id_offset);
-		ptr += sizeof(ib_uint32_t);
-
-		mach_write_to_4(ptr, index->n_user_defined_cols);
-		ptr += sizeof(ib_uint32_t);
-
-		mach_write_to_4(ptr, index->n_uniq);
-		ptr += sizeof(ib_uint32_t);
-
-		mach_write_to_4(ptr, index->n_nullable);
-		ptr += sizeof(ib_uint32_t);
-
-		mach_write_to_4(ptr, index->n_fields);
-
-		if (fwrite(row, 1, sizeof(row), file) != sizeof(row)) {
-
-			msg("xtrabackup: Error: writing index meta-data.");
-
-			return(false);
-		}
-
-		/* Write the length of the index name.
-		NUL byte is included in the length. */
-		ib_uint32_t	len = (ib_uint32_t)strlen(index->name) + 1;
-		ut_a(len > 1);
-
-		mach_write_to_4(row, len);
-
-		if (fwrite(row, 1, sizeof(len), file) != sizeof(len)
-		    || fwrite(index->name, 1, len, file) != len) {
-
-			msg("xtrabackup: Error: writing index name.");
-
-			return(false);
-		}
-
-		ret = xb_export_cfg_write_index_fields(index, file);
-	}
-
-	return(ret);
-}
-
-/*********************************************************************//**
-Write the meta data (table columns) config file. Serialise the contents of
-dict_col_t structure, along with the column name. All fields are serialized
-as ib_uint32_t.
-@return true in case of success otherwise false. */
-static	__attribute__((nonnull, warn_unused_result))
-bool
-xb_export_cfg_write_table(
-/*====================*/
-	const dict_table_t*	table,	/*!< in: write the meta data for
-					this table */
-	FILE*			file)	/*!< in: file to write to */
-{
-	dict_col_t*		col;
-	byte			row[sizeof(ib_uint32_t) * 7];
-
-	col = table->cols;
-
-	for (ulint i = 0; i < table->n_cols; ++i, ++col) {
-		byte*		ptr = row;
-
-		mach_write_to_4(ptr, col->prtype);
-		ptr += sizeof(ib_uint32_t);
-
-		mach_write_to_4(ptr, col->mtype);
-		ptr += sizeof(ib_uint32_t);
-
-		mach_write_to_4(ptr, col->len);
-		ptr += sizeof(ib_uint32_t);
-
-		mach_write_to_4(ptr, col->mbminmaxlen);
-		ptr += sizeof(ib_uint32_t);
-
-		mach_write_to_4(ptr, col->ind);
-		ptr += sizeof(ib_uint32_t);
-
-		mach_write_to_4(ptr, col->ord_part);
-		ptr += sizeof(ib_uint32_t);
-
-		mach_write_to_4(ptr, col->max_prefix);
-
-		if (fwrite(row, 1, sizeof(row), file) != sizeof(row)) {
-			msg("xtrabackup: Error: writing table column data.");
-
-			return(false);
-		}
-
-		/* Write out the column name as [len, byte array]. The len
-		includes the NUL byte. */
-		ib_uint32_t	len;
-		const char*	col_name;
-
-		col_name = dict_table_get_col_name(table, dict_col_get_no(col));
-
-		/* Include the NUL byte in the length. */
-		len = (ib_uint32_t)strlen(col_name) + 1;
-		ut_a(len > 1);
-
-		mach_write_to_4(row, len);
-
-		if (fwrite(row, 1,  sizeof(len), file) != sizeof(len)
-		    || fwrite(col_name, 1, len, file) != len) {
-
-			msg("xtrabackup: Error: writing column name.");
-
-			return(false);
-		}
-	}
-
-	return(true);
-}
-
-/*********************************************************************//**
-Write the meta data config file header.
-@return true in case of success otherwise false. */
-static	__attribute__((nonnull, warn_unused_result))
-bool
-xb_export_cfg_write_header(
-/*=====================*/
-	const dict_table_t*	table,	/*!< in: write the meta data for
-					this table */
-	FILE*			file)	/*!< in: file to write to */
-{
-	byte			value[sizeof(ib_uint32_t)];
-
-	/* Write the meta-data version number. */
-	mach_write_to_4(value, IB_EXPORT_CFG_VERSION_V1);
-
-	if (fwrite(&value, 1, sizeof(value), file) != sizeof(value)) {
-		msg("xtrabackup: Error: writing meta-data version number.");
-
-		return(false);
-	}
-
-	/* Write the server hostname. */
-	ib_uint32_t		len;
-	const char*		hostname = "Hostname unknown";
-
-	/* The server hostname includes the NUL byte. */
-	len = (ib_uint32_t)strlen(hostname) + 1;
-	mach_write_to_4(value, len);
-
-	if (fwrite(&value, 1,  sizeof(value), file) != sizeof(value)
-	    || fwrite(hostname, 1,  len, file) != len) {
-
-		msg("xtrabackup: Error: writing hostname.");
-
-		return(false);
-	}
-
-	/* The table name includes the NUL byte. */
-	const char*	table_name = table->name.m_name;
-	ut_a(table_name != 0);
-	len = (ib_uint32_t)strlen(table_name) + 1;
-
-	/* Write the table name. */
-	mach_write_to_4(value, len);
-
-	if (fwrite(&value, 1,  sizeof(value), file) != sizeof(value)
-	    || fwrite(table_name, 1,  len, file) != len) {
-
-		msg("xtrabackup: Error: writing table name.");
-
-		return(false);
-	}
-
-	byte		row[sizeof(ib_uint32_t) * 3];
-
-	/* Write the next autoinc value. */
-	mach_write_to_8(row, table->autoinc);
-
-	if (fwrite(row, 1, sizeof(ib_uint64_t), file) != sizeof(ib_uint64_t)) {
-		msg("xtrabackup: Error: writing table autoinc value.");
-
-		return(false);
-	}
-
-	byte*		ptr = row;
-
-	/* Write the system page size. */
-	mach_write_to_4(ptr, UNIV_PAGE_SIZE);
-	ptr += sizeof(ib_uint32_t);
-
-	/* Write the table->flags. */
-	mach_write_to_4(ptr, table->flags);
-	ptr += sizeof(ib_uint32_t);
-
-	/* Write the number of columns in the table. */
-	mach_write_to_4(ptr, table->n_cols);
-
-	if (fwrite(row, 1,  sizeof(row), file) != sizeof(row)) {
-		msg("xtrabackup: Error: writing table meta-data.");
-
-		return(false);
-	}
-
-	return(true);
-}
-
-/*********************************************************************//**
-Write MySQL 5.6-style meta data config file.
-@return true in case of success otherwise false. */
-static
-bool
-xb_export_cfg_write(
-	const fil_node_t*	node,
-	const dict_table_t*	table)	/*!< in: write the meta data for
-					this table */
-{
-	char	file_path[FN_REFLEN];
-	FILE*	file;
-	bool	success;
-
-	strcpy(file_path, node->name);
-	strcpy(file_path + strlen(file_path) - 4, ".cfg");
-
-	file = fopen(file_path, "w+b");
-
-	if (file == NULL) {
-		msg("xtrabackup: Error: cannot open %s\n", node->name);
-
-		success = false;
-	} else {
-
-		success = xb_export_cfg_write_header(table, file);
-
-		if (success) {
-			success = xb_export_cfg_write_table(table, file);
-		}
-
-		if (success) {
-			success = xb_export_cfg_write_indexes(table, file);
-		}
-
-		if (fclose(file) != 0) {
-			msg("xtrabackup: Error: cannot close %s\n", node->name);
-			success = false;
-		}
-
-	}
-
-	return(success);
-
-}
 
 static
 void
@@ -5025,6 +4680,8 @@ xtrabackup_prepare_func(char** argv)
 	xtrabackup_target_dir= mysql_data_home_buff;
 	xtrabackup_target_dir[0]=FN_CURLIB;		// all paths are relative from here
 	xtrabackup_target_dir[1]=0;
+	const lsn_t target_lsn = xtrabackup_incremental
+		? incremental_to_lsn : metadata_to_lsn;
 
 	/*
 	  read metadata of target
@@ -5184,8 +4841,6 @@ xtrabackup_prepare_func(char** argv)
 	}
 
 	/* Check whether the log is applied enough or not. */
-	const lsn_t target_lsn = xtrabackup_incremental
-		? incremental_to_lsn : metadata_to_lsn;
 	if ((srv_start_lsn || fil_space_get(SRV_LOG_SPACE_FIRST_ID))
 	    && srv_start_lsn < target_lsn) {
 		msg("xtrabackup: error: "
