@@ -1154,51 +1154,41 @@ static void append_export_table(const char *dbname, const char *tablename, bool 
   }
 }
 
-static std::string get_export_tables_stmt()
-{
-  std::string s="FLUSH TABLES ";
-  enumerate_ibd_files(append_export_table);
-  size_t N= tables_for_export.size();
-  if (N == 0)
-    return "";
-  for (size_t i= 0; i < N; i++)
-  {
-    if (i)
-      s+=",";
-
-    s+= tables_for_export[i];
-  }
-  s += " FOR EXPORT;";
-  return s;
-}
 
 #define BOOTSTRAP_FILENAME "mariabackup_prepare_for_export.sql"
+
+static int create_bootstrap_file()
+{
+  FILE *f= fopen(BOOTSTRAP_FILENAME,"wb");
+  if(!f)
+   return -1;
+
+  fputs("SET NAMES UTF8;\n",f);
+  enumerate_ibd_files(append_export_table);
+  for (size_t i= 0; i < tables_for_export.size(); i++)
+  {
+     const char *tab = tables_for_export[i].c_str();
+     fprintf(f,
+     "BEGIN NOT ATOMIC "
+       "DECLARE CONTINUE HANDLER FOR NOT FOUND,SQLEXCEPTION BEGIN END;"
+       "FLUSH TABLES %s FOR EXPORT;"
+     "END;\n"
+     "UNLOCK TABLES;\n",
+      tab);
+  }
+  fclose(f);
+  return 0;
+}
 
 static int prepare_export()
 {
   int err= -1;
 
   char cmdline[2*FN_REFLEN];
-
-  std::string content = get_export_tables_stmt();
-
-  FILE *bootstrap_file= fopen(BOOTSTRAP_FILENAME,"w");
-  if(!bootstrap_file)
-    goto end;
-
-  if (content.size())
-  {
-    if (fputs("SET NAMES UTF8;\n",bootstrap_file) < 0)
-      goto end;
-
-    if (fputs(content.c_str(), bootstrap_file) < 0)
-      goto end;
-  }
-
-  fclose(bootstrap_file);
-  bootstrap_file=0;
   FILE *outf;
 
+  if (create_bootstrap_file())
+    return -1;
 
   // Process defaults-file , it can have some --lc-language stuff,
   // which is* unfortunately* still necessary to get mysqld up
@@ -1240,8 +1230,6 @@ static int prepare_export()
   err = pclose(outf);
 
 end:
-  if(bootstrap_file)
-    fclose(bootstrap_file);
   unlink(BOOTSTRAP_FILENAME);
   return err;
 }
