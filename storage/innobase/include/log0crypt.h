@@ -71,10 +71,11 @@ log_crypt_read_checkpoint_buf(const byte* buf);
 
 /** Encrypt or decrypt log blocks.
 @param[in,out]	buf	log blocks to encrypt or decrypt
+@param[in]	lsn	log sequence number of the start of the buffer
 @param[in]	size	size of the buffer, in bytes
 @param[in]	decrypt	whether to decrypt instead of encrypting */
 UNIV_INTERN
 void
-log_crypt(byte* buf, ulint size, bool decrypt = false);
+log_crypt(byte* buf, lsn_t lsn, ulint size, bool decrypt = false);
 
 #endif  // log0crypt.h
